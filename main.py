@@ -15,8 +15,11 @@ Notes:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import re
+import socket
 import sys
 from dataclasses import dataclass
 from getpass import getpass
@@ -27,6 +30,49 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 DEFAULT_TIMEOUT = 60
+
+TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "admin": {
+        "csr_defaults": {
+            "admin": True,
+            "eap": False,
+            "portal": False,
+            "pxgrid": False,
+            "radius": False,
+            "saml": False,
+            "ims": False,
+        },
+        "bind_defaults": {
+            "admin": True,
+            "eap": False,
+            "portal": False,
+            "pxgrid": False,
+            "radius": False,
+            "saml": False,
+            "ims": False,
+        },
+    },
+    "pxgrid": {
+        "csr_defaults": {
+            "admin": False,
+            "eap": False,
+            "portal": False,
+            "pxgrid": True,
+            "radius": False,
+            "saml": False,
+            "ims": False,
+        },
+        "bind_defaults": {
+            "admin": False,
+            "eap": False,
+            "portal": False,
+            "pxgrid": True,
+            "radius": False,
+            "saml": False,
+            "ims": False,
+        },
+    },
+}
 
 
 # ----------------------------
@@ -155,6 +201,60 @@ def read_cert_pem(path: Path) -> str:
     return pem
 
 
+def normalize_base_url(base_url: str) -> str:
+    base_url = base_url.strip()
+    if not base_url:
+        die("Missing ise.base_url in config.")
+    if not base_url.startswith(("http://", "https://")):
+        die("ise.base_url must include scheme (http:// or https://).")
+    return base_url.rstrip("/")
+
+
+def env_password() -> str:
+    return os.environ.get("ISE_PASSWORD", "").strip()
+
+
+def extract_cn(subject: str) -> Optional[str]:
+    match = re.search(r"CN=([^,]+)", subject)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def resolve_name(name: str) -> bool:
+    try:
+        socket.getaddrinfo(name, None)
+        return True
+    except socket.gaierror:
+        return False
+
+
+def validate_names(
+    host: str,
+    subject: str,
+    sans: list[str],
+    *,
+    validate_dns: bool,
+    allow_unresolvable: bool,
+) -> None:
+    if not validate_dns:
+        return
+
+    cn = extract_cn(subject)
+    if not cn:
+        die(f"{host}: subject missing CN, cannot validate DNS: {subject}")
+
+    to_check = [cn]
+    for san in sans:
+        if san.startswith("DNS:"):
+            to_check.append(san.replace("DNS:", "", 1).strip())
+
+    unresolved = [name for name in to_check if name and not resolve_name(name)]
+    if unresolved and not allow_unresolvable:
+        names = ", ".join(unresolved)
+        die(f"{host}: DNS validation failed for {names}. Set allow_unresolvable to override.")
+
+
 # ----------------------------
 # Config model
 # ----------------------------
@@ -174,6 +274,8 @@ class AppConfig:
     signed_dir: Path
     csr_defaults: Dict[str, Any]
     bind_defaults: Dict[str, Any]
+    validate_dns: bool
+    allow_unresolvable: bool
     nodes: list[Dict[str, Any]]
 
 
@@ -181,9 +283,9 @@ def load_app_config(config_path: Path) -> AppConfig:
     raw = load_json(config_path)
 
     ise_raw = raw.get("ise") or {}
-    base_url = ise_raw.get("base_url") or die("Missing ise.base_url in config.")
+    base_url = normalize_base_url(str(ise_raw.get("base_url") or ""))
     username = ise_raw.get("username") or die("Missing ise.username in config.")
-    password = ise_raw.get("password") or ""
+    password = ise_raw.get("password") or env_password() or ""
 
     verify_tls = bool(ise_raw.get("verify_tls", True))
 
@@ -192,9 +294,22 @@ def load_app_config(config_path: Path) -> AppConfig:
 
     csr_defaults = raw.get("csr_defaults") or {}
     bind_defaults = raw.get("bind_defaults") or {}
+    validate_dns = bool(raw.get("validate_dns", True))
+    allow_unresolvable = bool(raw.get("allow_unresolvable", False))
     nodes = raw.get("nodes") or []
     if not nodes:
         die("Config has no nodes[]. Add at least one node with hostName.")
+
+    deduped_nodes: list[Dict[str, Any]] = []
+    seen_hosts = set()
+    for node in nodes:
+        host = node.get("hostName")
+        if not host:
+            die("Every node entry must include hostName.")
+        if host in seen_hosts:
+            die(f"Duplicate hostName in nodes: {host}")
+        seen_hosts.add(host)
+        deduped_nodes.append(node)
 
     # Prompt for password if blank/placeholder
     if not password or password.strip().upper() in ("CHANGEME", "CHANGE_ME", "PASSWORD"):
@@ -208,8 +323,56 @@ def load_app_config(config_path: Path) -> AppConfig:
         signed_dir=signed_dir,
         csr_defaults=csr_defaults,
         bind_defaults=bind_defaults,
-        nodes=nodes,
+        validate_dns=validate_dns,
+        allow_unresolvable=allow_unresolvable,
+        nodes=deduped_nodes,
     )
+
+
+def build_template_config(template: str) -> Dict[str, Any]:
+    base = {
+        "ise": {
+            "base_url": "https://ise.example.local",
+            "username": "admin",
+            "password": "CHANGEME",
+            "verify_tls": True,
+        },
+        "output_dir": "./out",
+        "signed_dir": "./signed",
+        "validate_dns": True,
+        "allow_unresolvable": False,
+        "csr_defaults": {
+            "subject_template": "CN={host}",
+            "keyLength": 2048,
+            "digest": "SHA256",
+            "san": [],
+        },
+        "bind_defaults": {
+            "friendlyName": "ise-signed",
+            "validateCertificateExtensions": True,
+            "allowOutOfDateCert": False,
+            "allowExtendedValidity": False,
+            "allowReplacementOfCertificates": True,
+            "allowReplacementOfPortalGroupTag": True,
+        },
+        "nodes": [
+            {
+                "hostName": "ise-1.example.local",
+                "subject": "CN=ise-1.example.local",
+                "san": ["DNS:ise-1.example.local"],
+            }
+        ],
+    }
+    if template not in TEMPLATES:
+        die(f"Unknown template: {template}")
+    base["csr_defaults"].update(TEMPLATES[template]["csr_defaults"])
+    base["bind_defaults"].update(TEMPLATES[template]["bind_defaults"])
+    return base
+
+
+def print_template(template: str) -> None:
+    data = build_template_config(template)
+    print(json.dumps(data, indent=2))
 
 
 # ----------------------------
@@ -249,13 +412,21 @@ def generate_and_export(cfg: AppConfig) -> None:
             continue
 
         subject = node.get("subject") or subject_template.format(host=host)
+        sans = node.get("san", csr_defaults.get("san", []))
+        validate_names(
+            host,
+            subject,
+            sans,
+            validate_dns=bool(node.get("validate_dns", cfg.validate_dns)),
+            allow_unresolvable=bool(node.get("allow_unresolvable", cfg.allow_unresolvable)),
+        )
 
         payload = {
             "hostName": host,
             "subject": subject,
             "keyLength": int(node.get("keyLength", csr_defaults.get("keyLength", 2048))),
             "digest": node.get("digest", csr_defaults.get("digest", "SHA256")),
-            "subjectAltNames": node.get("san", csr_defaults.get("san", [])),
+            "subjectAltNames": sans,
             "admin": bool(node.get("admin", csr_defaults.get("admin", True))),
             "eap": bool(node.get("eap", csr_defaults.get("eap", True))),
             "portal": bool(node.get("portal", csr_defaults.get("portal", False))),
@@ -400,14 +571,39 @@ def print_menu() -> None:
         "4) Exit\n"
     )
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Interactive CSR tool for Cisco ISE (ISE 3.1+ OpenAPI Certificates).",
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        default="./config.json",
+        help="Path to config.json (default: ./config.json).",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt.",
+    )
+    parser.add_argument(
+        "--template",
+        choices=sorted(TEMPLATES.keys()),
+        help="Print a starter config template and exit.",
+    )
+    return parser.parse_args()
+
 
 def main() -> None:
+    args = parse_args()
+
     print("\nCisco ISE CSR Tool (interactive)\n")
 
-    # Config selection
-    default_cfg = Path("./config.json").resolve()
-    cfg_path_in = prompt("Path to config.json", str(default_cfg))
-    cfg_path = Path(cfg_path_in).expanduser().resolve()
+    if args.template:
+        print_template(args.template)
+        return
+
+    cfg_path = Path(args.config).expanduser().resolve()
     if not cfg_path.exists():
         die(f"Config file not found: {cfg_path}")
 
@@ -421,7 +617,7 @@ def main() -> None:
     print(f"- signed_dir   : {cfg.signed_dir}")
     print(f"- nodes        : {len(cfg.nodes)}")
 
-    if not yes_no("\nContinue?", True):
+    if not args.yes and not yes_no("\nContinue?", True):
         raise SystemExit(0)
 
     while True:
