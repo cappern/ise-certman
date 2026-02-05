@@ -49,8 +49,6 @@ Available templates: `admin`, `pxgrid`.
   },
   "output_dir": "./out",
   "signed_dir": "./signed",
-  "validate_dns": true,
-  "allow_unresolvable": false,
   "csr_defaults": {
     "subject_template": "CN={host}",
     "keyLength": 2048,
@@ -83,9 +81,7 @@ Available templates: `admin`, `pxgrid`.
     {
       "hostName": "ise-1.example.local",
       "subject": "CN=ise-1.example.local",
-      "san": ["DNS:ise-1.example.local"],
-      "validate_dns": true,
-      "allow_unresolvable": false
+      "san": ["DNS:ise-1.example.local"]
     },
     {
       "hostName": "ise-2.example.local",
@@ -105,34 +101,25 @@ Available templates: `admin`, `pxgrid`.
 export ISE_PASSWORD='your-password'
 ```
 
-### DNS validation
-
-When `validate_dns` is true, the tool resolves the subject `CN` and any `DNS:` SAN entries before creating CSRs. If resolution fails, set `allow_unresolvable` to `true` (global or per-node) to override.
-
 ## Run
 
 ```bash
-python main.py
+python main.py --config ./config.json
 ```
 
 Optional flags:
 
-- `--state` to point at a different state file.
-- `--config` to use config-driven mode with a specific config file.
-- `--yes` to skip the confirmation prompt (config-driven only).
-- `--template` to print a starter config (e.g., `admin` or `pxgrid`).
+- `--yes` to skip the confirmation prompt.
+- `--config` to point at a different config file.
 
-## Typical workflow (state-driven)
+## Typical workflow
 
-1. **Create/select a connection** when the tool starts.
-2. **Create a certificate template** (e.g., admin cert for DMZ ISE, admin cert for internal ISE).
-3. **Select nodes** that the template applies to.
-4. **Generate CSRs** (option `1`) to create CSRs and export them to `out/csrs/`.
-5. **Sign CSRs** with your CA.
-6. **Place signed certs** as `signed/<hostName>.crt.pem` (or `.pem` / `.crt`).
-7. **Bind certs** (option `2`) to apply them to ISE.
+1. **Generate CSRs**: choose option `1` to create CSRs and export them to `output_dir/csrs/`.
+2. **Sign CSRs**: have your CA sign each `*.csr.pem` file.
+3. **Place signed certs**: save each signed certificate as `signed/<hostName>.crt.pem` (or `.pem` / `.crt`).
+4. **Bind certs**: choose option `2` to bind the signed certs back to ISE.
 
-The tool keeps a lightweight state file for connections, templates, and CSR ids per cluster.
+The tool keeps a `csr_map.json` in `output_dir` to track the CSR ids per host.
 
 ## Troubleshooting
 
