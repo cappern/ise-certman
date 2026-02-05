@@ -18,6 +18,19 @@ pip install -r requirements.txt
 
 ## Configuration
 
+This tool supports two modes:
+
+1. **State-driven (recommended)**: interactively create connections and certificate templates, stored in a lightweight state file.
+2. **Config-driven**: supply a static `config.json` with explicit node list (legacy workflow).
+
+### State-driven mode (recommended)
+
+On launch, you can create/select a **connection** (cluster) and then create **certificate templates** that define CSR/bind parameters and which nodes they apply to. The tool will fetch all nodes in the cluster automatically and store lightweight CSR state per cluster and template.
+
+You can override the state file location with `--state` (default: `~/.ise-certman/state.json`).
+
+### Config-driven mode
+
 Create a `config.json` in the repo root (or pass `--config` to point elsewhere). You can also generate a starter file using a template:
 
 ```bash
@@ -99,23 +112,27 @@ When `validate_dns` is true, the tool resolves the subject `CN` and any `DNS:` S
 ## Run
 
 ```bash
-python main.py --config ./config.json
+python main.py
 ```
 
 Optional flags:
 
-- `--yes` to skip the confirmation prompt.
-- `--config` to point at a different config file.
+- `--state` to point at a different state file.
+- `--config` to use config-driven mode with a specific config file.
+- `--yes` to skip the confirmation prompt (config-driven only).
 - `--template` to print a starter config (e.g., `admin` or `pxgrid`).
 
-## Typical workflow
+## Typical workflow (state-driven)
 
-1. **Generate CSRs**: choose option `1` to create CSRs and export them to `output_dir/csrs/`.
-2. **Sign CSRs**: have your CA sign each `*.csr.pem` file.
-3. **Place signed certs**: save each signed certificate as `signed/<hostName>.crt.pem` (or `.pem` / `.crt`).
-4. **Bind certs**: choose option `2` to bind the signed certs back to ISE.
+1. **Create/select a connection** when the tool starts.
+2. **Create a certificate template** (e.g., admin cert for DMZ ISE, admin cert for internal ISE).
+3. **Select nodes** that the template applies to.
+4. **Generate CSRs** (option `1`) to create CSRs and export them to `out/csrs/`.
+5. **Sign CSRs** with your CA.
+6. **Place signed certs** as `signed/<hostName>.crt.pem` (or `.pem` / `.crt`).
+7. **Bind certs** (option `2`) to apply them to ISE.
 
-The tool keeps a `csr_map.json` in `output_dir` to track the CSR ids per host.
+The tool keeps a lightweight state file for connections, templates, and CSR ids per cluster.
 
 ## Troubleshooting
 

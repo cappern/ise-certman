@@ -74,6 +74,8 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+STATE_DEFAULT_PATH = Path.home() / ".ise-certman" / "state.json"
+
 
 # ----------------------------
 # Helpers
@@ -255,6 +257,32 @@ def validate_names(
         die(f"{host}: DNS validation failed for {names}. Set allow_unresolvable to override.")
 
 
+def state_path(path_override: Optional[str]) -> Path:
+    if path_override:
+        return Path(path_override).expanduser().resolve()
+    return STATE_DEFAULT_PATH
+
+
+def load_state(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"connections": {}, "templates": {}, "csr_map": {}}
+    return load_json(path)
+
+
+def save_state(path: Path, data: Dict[str, Any]) -> None:
+    save_json(path, data)
+
+
+def prompt_bool(msg: str, default: bool) -> bool:
+    return yes_no(msg, default)
+
+
+def parse_san_list(raw: str) -> list[str]:
+    if not raw.strip():
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 # ----------------------------
 # Config model
 # ----------------------------
@@ -376,6 +404,228 @@ def print_template(template: str) -> None:
 
 
 # ----------------------------
+# State + interactive helpers
+# ----------------------------
+
+def fetch_cluster_nodes(ise: IseConfig) -> list[Dict[str, Any]]:
+    r = http_request(
+        "GET",
+        ise.base_url,
+        ise.username,
+        ise.password,
+        ise.verify_tls,
+        "/api/v1/deployment/node",
+    )
+    ensure_ok(r, "Fetch cluster nodes")
+    data = r.json()
+    nodes_raw = data.get("response") or data.get("nodes") or []
+    nodes: list[Dict[str, Any]] = []
+    for item in nodes_raw:
+        host = item.get("hostName") or item.get("hostname") or item.get("name")
+        if host:
+            nodes.append({"hostName": host})
+    if not nodes:
+        die("No nodes returned from cluster.")
+    return nodes
+
+
+def select_nodes(all_nodes: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    print("\nAvailable nodes:")
+    for idx, node in enumerate(all_nodes, start=1):
+        print(f"{idx}) {node['hostName']}")
+    choice = prompt("Select nodes (comma-separated numbers or 'all')", "all")
+    if choice.lower() == "all":
+        return all_nodes
+    selections = []
+    for part in choice.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            die(f"Invalid selection: {part}")
+        idx = int(part)
+        if idx < 1 or idx > len(all_nodes):
+            die(f"Selection out of range: {part}")
+        selections.append(all_nodes[idx - 1])
+    if not selections:
+        die("No nodes selected.")
+    return selections
+
+
+def choose_connection(state: Dict[str, Any], *, state_file: Path) -> Tuple[str, Dict[str, Any]]:
+    connections = state.get("connections", {})
+    if connections:
+        print("\nConnections:")
+        names = sorted(connections.keys())
+        for idx, name in enumerate(names, start=1):
+            print(f"{idx}) {name} ({connections[name].get('base_url')})")
+        print(f"{len(names) + 1}) Create new connection")
+        choice = prompt("Select connection", "1")
+        if choice.isdigit() and 1 <= int(choice) <= len(names):
+            name = names[int(choice) - 1]
+            return name, connections[name]
+        if choice == str(len(names) + 1):
+            return create_connection(state, state_file=state_file)
+        die("Invalid connection selection.")
+    return create_connection(state, state_file=state_file)
+
+
+def create_connection(state: Dict[str, Any], *, state_file: Path) -> Tuple[str, Dict[str, Any]]:
+    print("\nCreate new connection:")
+    name = prompt("Connection name")
+    base_url = normalize_base_url(prompt("ISE base URL (https://...)"))
+    username = prompt("ISE username")
+    verify_tls = prompt_bool("Verify TLS certificates?", True)
+    connection = {
+        "base_url": base_url,
+        "username": username,
+        "verify_tls": verify_tls,
+    }
+    state.setdefault("connections", {})[name] = connection
+    save_state(state_file, state)
+    return name, connection
+
+
+def prompt_template_details() -> Dict[str, Any]:
+    print("\nDefine certificate template details:")
+    subject_template = prompt("Subject template (use {host})", "CN={host}")
+    key_length = int(prompt("Key length", "2048"))
+    digest = prompt("Digest", "SHA256")
+    san_raw = prompt("Default SANs (comma-separated, use DNS:..., empty for none)", "")
+    san = parse_san_list(san_raw)
+
+    def usage_flags(prefix: str) -> Dict[str, bool]:
+        return {
+            "admin": prompt_bool(f"{prefix} admin?", True),
+            "eap": prompt_bool(f"{prefix} eap?", True),
+            "portal": prompt_bool(f"{prefix} portal?", False),
+            "pxgrid": prompt_bool(f"{prefix} pxgrid?", False),
+            "radius": prompt_bool(f"{prefix} radius?", False),
+            "saml": prompt_bool(f"{prefix} saml?", False),
+            "ims": prompt_bool(f"{prefix} ims?", False),
+        }
+
+    validate_dns = prompt_bool("Validate CN/SAN via DNS?", True)
+    allow_unresolvable = prompt_bool("Allow unresolvable names?", False)
+
+    csr_defaults = {
+        "subject_template": subject_template,
+        "keyLength": key_length,
+        "digest": digest,
+        "san": san,
+        **usage_flags("CSR"),
+    }
+    bind_defaults = {
+        "friendlyName": prompt("Friendly name", "ise-signed"),
+        **usage_flags("Bind"),
+        "validateCertificateExtensions": prompt_bool("Validate cert extensions?", True),
+        "allowOutOfDateCert": prompt_bool("Allow out-of-date cert?", False),
+        "allowExtendedValidity": prompt_bool("Allow extended validity?", False),
+        "allowReplacementOfCertificates": prompt_bool("Allow replacement of certificates?", True),
+        "allowReplacementOfPortalGroupTag": prompt_bool("Allow replacement of portal group tag?", True),
+    }
+
+    return {
+        "validate_dns": validate_dns,
+        "allow_unresolvable": allow_unresolvable,
+        "csr_defaults": csr_defaults,
+        "bind_defaults": bind_defaults,
+    }
+
+
+def create_template(
+    state: Dict[str, Any],
+    *,
+    state_file: Path,
+    connection_name: str,
+    nodes: list[Dict[str, Any]],
+) -> str:
+    print("\nCreate new certificate template:")
+    name = prompt("Template name")
+    details = prompt_template_details()
+    apply_nodes = select_nodes(nodes)
+    template = {
+        "connection": connection_name,
+        "nodes": [node["hostName"] for node in apply_nodes],
+        "validate_dns": details["validate_dns"],
+        "allow_unresolvable": details["allow_unresolvable"],
+        "csr_defaults": details["csr_defaults"],
+        "bind_defaults": details["bind_defaults"],
+    }
+    state.setdefault("templates", {})[name] = template
+    save_state(state_file, state)
+    return name
+
+
+def choose_template(
+    state: Dict[str, Any],
+    *,
+    state_file: Path,
+    connection_name: str,
+    nodes: list[Dict[str, Any]],
+) -> str:
+    templates = state.get("templates", {})
+    filtered = {k: v for k, v in templates.items() if v.get("connection") == connection_name}
+    if filtered:
+        names = sorted(filtered.keys())
+        print("\nTemplates:")
+        for idx, name in enumerate(names, start=1):
+            print(f"{idx}) {name}")
+        print(f"{len(names) + 1}) Create new template")
+        choice = prompt("Select template", "1")
+        if choice.isdigit() and 1 <= int(choice) <= len(names):
+            return names[int(choice) - 1]
+        if choice == str(len(names) + 1):
+            return create_template(state, state_file=state_file, connection_name=connection_name, nodes=nodes)
+        die("Invalid template selection.")
+    return create_template(state, state_file=state_file, connection_name=connection_name, nodes=nodes)
+
+
+def build_config_from_template(
+    connection: Dict[str, Any],
+    *,
+    password: str,
+    template: Dict[str, Any],
+    nodes: list[Dict[str, Any]],
+) -> AppConfig:
+    return AppConfig(
+        ise=IseConfig(
+            base_url=connection["base_url"],
+            username=connection["username"],
+            password=password,
+            verify_tls=bool(connection.get("verify_tls", True)),
+        ),
+        output_dir=Path("./out").resolve(),
+        signed_dir=Path("./signed").resolve(),
+        csr_defaults=template.get("csr_defaults", {}),
+        bind_defaults=template.get("bind_defaults", {}),
+        validate_dns=bool(template.get("validate_dns", True)),
+        allow_unresolvable=bool(template.get("allow_unresolvable", False)),
+        nodes=nodes,
+    )
+
+
+def update_state_csr_map(
+    state: Dict[str, Any],
+    *,
+    state_file: Path,
+    connection_name: str,
+    host: str,
+    csr_id: str,
+    subject: str,
+    template_name: str,
+) -> None:
+    csr_map = state.setdefault("csr_map", {})
+    conn_map = csr_map.setdefault(connection_name, {})
+    conn_map[host] = {"id": csr_id, "subject": subject, "template": template_name}
+    save_state(state_file, state)
+
+
+def load_state_csr_map(state: Dict[str, Any], connection_name: str) -> Dict[str, Any]:
+    return state.get("csr_map", {}).get(connection_name, {})
+
+
+# ----------------------------
 # CSR map
 # ----------------------------
 
@@ -398,7 +648,14 @@ def save_csr_map(cfg: AppConfig, data: Dict[str, Any]) -> None:
 # Operations
 # ----------------------------
 
-def generate_and_export(cfg: AppConfig) -> None:
+def generate_and_export(
+    cfg: AppConfig,
+    *,
+    state: Optional[Dict[str, Any]] = None,
+    state_file: Optional[Path] = None,
+    connection_name: Optional[str] = None,
+    template_name: Optional[str] = None,
+) -> None:
     ise = cfg.ise
     csr_map = load_csr_map(cfg)
 
@@ -454,6 +711,16 @@ def generate_and_export(cfg: AppConfig) -> None:
 
         csr_map["csrs"][host] = {"id": csr_id, "subject": subject}
         save_csr_map(cfg, csr_map)
+        if state and state_file and connection_name and template_name:
+            update_state_csr_map(
+                state,
+                state_file=state_file,
+                connection_name=connection_name,
+                host=host,
+                csr_id=csr_id,
+                subject=subject,
+                template_name=template_name,
+            )
 
         # Export CSR
         r2 = http_request(
@@ -476,9 +743,9 @@ def generate_and_export(cfg: AppConfig) -> None:
     print(f"\nDone.\nCSR map -> {csr_map_path(cfg)}")
 
 
-def bind_signed(cfg: AppConfig) -> None:
+def bind_signed(cfg: AppConfig, *, csr_map_override: Optional[Dict[str, Any]] = None) -> None:
     ise = cfg.ise
-    csr_map = load_csr_map(cfg)
+    csr_map = csr_map_override or load_csr_map(cfg)
 
     csrs = csr_map.get("csrs", {})
     if not csrs:
@@ -578,8 +845,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-c",
         "--config",
-        default="./config.json",
-        help="Path to config.json (default: ./config.json).",
+        help="Path to config.json (if provided, uses config-based mode).",
     )
     parser.add_argument(
         "--yes",
@@ -590,6 +856,10 @@ def parse_args() -> argparse.Namespace:
         "--template",
         choices=sorted(TEMPLATES.keys()),
         help="Print a starter config template and exit.",
+    )
+    parser.add_argument(
+        "--state",
+        help=f"Path to state file (default: {STATE_DEFAULT_PATH}).",
     )
     return parser.parse_args()
 
@@ -603,38 +873,155 @@ def main() -> None:
         print_template(args.template)
         return
 
-    cfg_path = Path(args.config).expanduser().resolve()
-    if not cfg_path.exists():
-        die(f"Config file not found: {cfg_path}")
+    if args.config:
+        cfg_path = Path(args.config).expanduser().resolve()
+        if not cfg_path.exists():
+            die(f"Config file not found: {cfg_path}")
 
-    cfg = load_app_config(cfg_path)
+        cfg = load_app_config(cfg_path)
 
-    print("\nLoaded config:")
-    print(f"- ISE base_url : {cfg.ise.base_url}")
-    print(f"- ISE username : {cfg.ise.username}")
-    print(f"- verify_tls   : {cfg.ise.verify_tls}")
-    print(f"- output_dir   : {cfg.output_dir}")
-    print(f"- signed_dir   : {cfg.signed_dir}")
-    print(f"- nodes        : {len(cfg.nodes)}")
+        print("\nLoaded config:")
+        print(f"- ISE base_url : {cfg.ise.base_url}")
+        print(f"- ISE username : {cfg.ise.username}")
+        print(f"- verify_tls   : {cfg.ise.verify_tls}")
+        print(f"- output_dir   : {cfg.output_dir}")
+        print(f"- signed_dir   : {cfg.signed_dir}")
+        print(f"- nodes        : {len(cfg.nodes)}")
 
-    if not args.yes and not yes_no("\nContinue?", True):
-        raise SystemExit(0)
+        if not args.yes and not yes_no("\nContinue?", True):
+            raise SystemExit(0)
+
+        while True:
+            print_menu()
+            choice = input("Select option (1-4): ").strip()
+
+            if choice == "1":
+                generate_and_export(cfg)
+            elif choice == "2":
+                bind_signed(cfg)
+            elif choice == "3":
+                show_csr_map(cfg)
+            elif choice == "4":
+                print("\nBye.\n")
+                break
+            else:
+                print("Invalid choice. Please select 1-4.")
+        return
+
+    state_file = state_path(args.state)
+    state = load_state(state_file)
+    connection_name, connection = choose_connection(state, state_file=state_file)
+    password = env_password() or getpass("ISE API password (input hidden): ").strip()
+    if not password:
+        die("Password required.")
+
+    ise = IseConfig(
+        base_url=connection["base_url"],
+        username=connection["username"],
+        password=password,
+        verify_tls=bool(connection.get("verify_tls", True)),
+    )
+    nodes = fetch_cluster_nodes(ise)
 
     while True:
-        print_menu()
-        choice = input("Select option (1-4): ").strip()
+        print(
+            "\nConnection menu\n"
+            "---------------\n"
+            f"Active connection: {connection_name}\n"
+            "1) Generate CSR from template\n"
+            "2) Bind signed certs from template\n"
+            "3) Manage templates\n"
+            "4) Switch connection\n"
+            "5) Show saved CSR state\n"
+            "6) Exit\n"
+        )
+        choice = prompt("Select option", "1")
 
         if choice == "1":
-            generate_and_export(cfg)
+            template_name = choose_template(
+                state,
+                state_file=state_file,
+                connection_name=connection_name,
+                nodes=nodes,
+            )
+            template = state["templates"][template_name]
+            template_nodes = [n for n in nodes if n["hostName"] in template.get("nodes", [])]
+            use_template_nodes = prompt_bool("Use template node list?", True)
+            if use_template_nodes and not template_nodes:
+                print("Template has no matching nodes for this cluster. Please select nodes.")
+                selected_nodes = select_nodes(nodes)
+            else:
+                selected_nodes = template_nodes if use_template_nodes else select_nodes(nodes)
+            cfg = build_config_from_template(
+                connection,
+                password=password,
+                template=template,
+                nodes=selected_nodes,
+            )
+            generate_and_export(
+                cfg,
+                state=state,
+                state_file=state_file,
+                connection_name=connection_name,
+                template_name=template_name,
+            )
         elif choice == "2":
-            bind_signed(cfg)
+            template_name = choose_template(
+                state,
+                state_file=state_file,
+                connection_name=connection_name,
+                nodes=nodes,
+            )
+            template = state["templates"][template_name]
+            selected_nodes = [n for n in nodes if n["hostName"] in template.get("nodes", [])]
+            cfg = build_config_from_template(
+                connection,
+                password=password,
+                template=template,
+                nodes=selected_nodes or nodes,
+            )
+            csr_map = load_state_csr_map(state, connection_name)
+            filtered_csrs = {host: meta for host, meta in csr_map.items() if meta.get("template") == template_name}
+            if not filtered_csrs:
+                print("\nNo CSR state found for this template. Generate CSRs first.\n")
+                continue
+            filtered_map = {"csrs": filtered_csrs}
+            bind_signed(cfg, csr_map_override=filtered_map)
         elif choice == "3":
-            show_csr_map(cfg)
+            choose_template(
+                state,
+                state_file=state_file,
+                connection_name=connection_name,
+                nodes=nodes,
+            )
         elif choice == "4":
+            connection_name, connection = choose_connection(state, state_file=state_file)
+            password = env_password() or getpass("ISE API password (input hidden): ").strip()
+            if not password:
+                die("Password required.")
+            ise = IseConfig(
+                base_url=connection["base_url"],
+                username=connection["username"],
+                password=password,
+                verify_tls=bool(connection.get("verify_tls", True)),
+            )
+            nodes = fetch_cluster_nodes(ise)
+        elif choice == "5":
+            csr_map = load_state_csr_map(state, connection_name)
+            if not csr_map:
+                print("\nNo CSR state saved for this connection.\n")
+            else:
+                print("\nSaved CSR state:")
+                for host, meta in csr_map.items():
+                    print(
+                        f"- {host}: id={meta.get('id')} subject={meta.get('subject')} "
+                        f"template={meta.get('template')}"
+                    )
+        elif choice == "6":
             print("\nBye.\n")
             break
         else:
-            print("Invalid choice. Please select 1-4.")
+            print("Invalid choice. Please select 1-6.")
 
 
 if __name__ == "__main__":
