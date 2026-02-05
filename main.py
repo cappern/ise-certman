@@ -194,6 +194,34 @@ def env_password() -> str:
     return os.environ.get("ISE_PASSWORD", "").strip()
 
 
+def normalize_san_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return [str(value)]
+
+
+def guess_host_from_subject(subject: str) -> Optional[str]:
+    if not subject:
+        return None
+    parts = [p.strip() for p in subject.split(",") if p.strip()]
+    for part in parts:
+        if part.upper().startswith("CN="):
+            return part[3:].strip()
+    return None
+
+
+def bool_from_mapping(data: Dict[str, Any], key: str, default: bool) -> bool:
+    if key not in data:
+        return default
+    return bool(data.get(key))
+
+
 # ----------------------------
 # Config model
 # ----------------------------
@@ -436,6 +464,154 @@ def show_csr_map(cfg: AppConfig) -> None:
     print("")
 
 
+def extract_cert_records(data: Dict[str, Any]) -> list[Dict[str, Any]]:
+    if "response" in data:
+        if isinstance(data["response"], list):
+            return data["response"]
+        if isinstance(data["response"], dict) and "response" in data["response"]:
+            nested = data["response"].get("response")
+            if isinstance(nested, list):
+                return nested
+    if "SearchResult" in data and isinstance(data["SearchResult"], dict):
+        resources = data["SearchResult"].get("resources")
+        if isinstance(resources, list):
+            return resources
+    if "resources" in data and isinstance(data["resources"], list):
+        return data["resources"]
+    return []
+
+
+def extract_cert_detail(data: Dict[str, Any]) -> Dict[str, Any]:
+    if "response" in data and isinstance(data["response"], dict):
+        return data["response"]
+    return data
+
+
+def list_certificates(cfg: AppConfig) -> list[Dict[str, Any]]:
+    ise = cfg.ise
+    r = http_request(
+        "GET",
+        ise.base_url,
+        ise.username,
+        ise.password,
+        ise.verify_tls,
+        "/api/v1/certs/certificate?size=200",
+        accept="application/json",
+    )
+    ensure_ok(r, "List certificates")
+    data = response_json(r, "List certificates")
+    records = extract_cert_records(data)
+
+    if not records:
+        print("\nNo certificates returned from ISE.\n")
+        return []
+
+    print("\nCertificates:\n")
+    for cert in records:
+        cert_id = cert.get("id") or cert.get("certId") or cert.get("uuid")
+        name = cert.get("friendlyName") or cert.get("name") or cert.get("subject") or "unknown"
+        host = cert.get("hostName") or cert.get("hostname") or ""
+        expires = cert.get("expirationDate") or cert.get("validTo") or cert.get("notAfter") or ""
+        status = cert.get("status") or cert.get("state") or ""
+        detail = " | ".join([item for item in [host, expires, status] if item])
+        suffix = f" ({detail})" if detail else ""
+        print(f"- id={cert_id} name={name}{suffix}")
+    print("")
+    return records
+
+
+def renew_certificate(cfg: AppConfig) -> None:
+    ise = cfg.ise
+    list_certificates(cfg)
+    cert_id = prompt("Enter certificate id to renew").strip()
+    if not cert_id:
+        print("No certificate id entered. Aborting.")
+        return
+
+    r = http_request(
+        "GET",
+        ise.base_url,
+        ise.username,
+        ise.password,
+        ise.verify_tls,
+        f"/api/v1/certs/certificate/{cert_id}",
+        accept="application/json",
+    )
+    ensure_ok(r, f"Get certificate details for {cert_id}")
+    detail = extract_cert_detail(response_json(r, f"Get certificate details for {cert_id}"))
+
+    csr_defaults = cfg.csr_defaults or {}
+    subject = detail.get("subject") or ""
+    host = detail.get("hostName") or detail.get("hostname") or guess_host_from_subject(subject)
+    if not host:
+        host = prompt("Host name for renewed CSR")
+
+    if not host:
+        die("Host name required to renew certificate.")
+
+    subject_template = csr_defaults.get("subject_template", "CN={host}")
+    if not subject:
+        subject = subject_template.format(host=host)
+
+    san = normalize_san_list(
+        detail.get("subjectAltNames")
+        or detail.get("subjectAltName")
+        or detail.get("san")
+        or csr_defaults.get("san", [])
+    )
+
+    payload = {
+        "hostName": host,
+        "subject": subject,
+        "keyLength": int(detail.get("keyLength", csr_defaults.get("keyLength", 2048))),
+        "digest": detail.get("digest", csr_defaults.get("digest", "SHA256")),
+        "subjectAltNames": san,
+        "admin": bool_from_mapping(detail, "admin", bool(csr_defaults.get("admin", True))),
+        "eap": bool_from_mapping(detail, "eap", bool(csr_defaults.get("eap", True))),
+        "portal": bool_from_mapping(detail, "portal", bool(csr_defaults.get("portal", False))),
+        "pxgrid": bool_from_mapping(detail, "pxgrid", bool(csr_defaults.get("pxgrid", False))),
+        "radius": bool_from_mapping(detail, "radius", bool(csr_defaults.get("radius", False))),
+        "saml": bool_from_mapping(detail, "saml", bool(csr_defaults.get("saml", False))),
+        "ims": bool_from_mapping(detail, "ims", bool(csr_defaults.get("ims", False))),
+    }
+
+    r2 = http_request(
+        "POST",
+        ise.base_url,
+        ise.username,
+        ise.password,
+        ise.verify_tls,
+        "/api/v1/certs/certificate-signing-request",
+        json_body=payload,
+    )
+    ensure_ok(r2, f"Create CSR for {host} (renew from cert {cert_id})")
+    data = response_json(r2, f"Create CSR for {host}")
+    csr_id = extract_csr_id(data)
+    if not csr_id:
+        die(f"CSR creation returned no id for {host}. Response: {data}")
+
+    csr_map = load_csr_map(cfg)
+    csr_map["csrs"][host] = {"id": csr_id, "subject": subject, "renewed_from": cert_id}
+    save_csr_map(cfg, csr_map)
+
+    r3 = http_request(
+        "GET",
+        ise.base_url,
+        ise.username,
+        ise.password,
+        ise.verify_tls,
+        f"/api/v1/certs/certificate-signing-request/{host}/{csr_id}",
+        accept="application/json",
+    )
+    ensure_ok(r3, f"Export CSR for {host}")
+    pem = extract_pem_from_export(r3)
+
+    csr_file = cfg.output_dir / "csrs" / f"{host}.csr.pem"
+    write_text(csr_file, pem)
+
+    print(f"[OK] {host}: renewed CSR id={csr_id} exported -> {csr_file}")
+
+
 # ----------------------------
 # Interactive Menu
 # ----------------------------
@@ -447,7 +623,9 @@ def print_menu() -> None:
         "1) Generate CSR on all nodes + Export CSR PEM files\n"
         "2) Bind signed cert PEM files to previous CSR\n"
         "3) Show CSR map (node -> CSR id)\n"
-        "4) Exit\n"
+        "4) List certificates\n"
+        "5) Renew certificate (generate CSR from existing cert)\n"
+        "6) Exit\n"
     )
 
 def parse_args() -> argparse.Namespace:
@@ -492,7 +670,7 @@ def main() -> None:
 
     while True:
         print_menu()
-        choice = input("Select option (1-4): ").strip()
+        choice = input("Select option (1-6): ").strip()
 
         if choice == "1":
             generate_and_export(cfg)
@@ -501,10 +679,14 @@ def main() -> None:
         elif choice == "3":
             show_csr_map(cfg)
         elif choice == "4":
+            list_certificates(cfg)
+        elif choice == "5":
+            renew_certificate(cfg)
+        elif choice == "6":
             print("\nBye.\n")
             break
         else:
-            print("Invalid choice. Please select 1-4.")
+            print("Invalid choice. Please select 1-6.")
 
 
 if __name__ == "__main__":

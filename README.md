@@ -102,6 +102,11 @@ Optional flags:
 
 The tool keeps a `csr_map.json` in `output_dir` to track the CSR ids per host.
 
+## Extra features
+
+- **List certificates**: choose option `4` to list certificates from ISE with basic metadata.
+- **Renew certificate**: choose option `5` to create a new CSR using the subject/SAN/key usage from an existing certificate, then export it to `output_dir/csrs/` and track it in `csr_map.json`.
+
 ## Troubleshooting
 
 - Ensure `ise.base_url` includes the scheme (e.g., `https://ise.example.local`).
