@@ -94,15 +94,32 @@ def http_request(
     if json_body is not None:
         headers["Content-Type"] = "application/json"
 
-    return requests.request(
-        method=method,
-        url=url,
-        headers=headers,
-        json=json_body,
-        auth=HTTPBasicAuth(user, password),
-        verify=verify_tls,
-        timeout=DEFAULT_TIMEOUT,
-    )
+    try:
+        return requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            json=json_body,
+            auth=HTTPBasicAuth(user, password),
+            verify=verify_tls,
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except requests.exceptions.SSLError as e:
+        die(
+            "TLS/SSL error while connecting to ISE. "
+            "If ISE uses a self-signed cert, set ise.verify_tls=false in config.json. "
+            f"Details: {e}"
+        )
+    except requests.exceptions.Timeout as e:
+        die(f"Request timed out after {DEFAULT_TIMEOUT}s: {url}\n{e}")
+    except requests.exceptions.ConnectionError as e:
+        die(
+            "Connection error while reaching ISE. "
+            "Check ise.base_url, DNS resolution, and network reachability.\n"
+            f"URL: {url}\n{e}"
+        )
+    except requests.exceptions.RequestException as e:
+        die(f"HTTP request failed: {url}\n{e}")
 
 
 def ensure_ok(resp: requests.Response, ctx: str) -> None:
@@ -110,6 +127,14 @@ def ensure_ok(resp: requests.Response, ctx: str) -> None:
         return
     body = resp.text.strip()
     die(f"{ctx} failed: HTTP {resp.status_code}\n{body[:2000]}")
+
+
+def response_json(resp: requests.Response, ctx: str) -> Dict[str, Any]:
+    try:
+        return resp.json()
+    except Exception as e:
+        body = resp.text.strip()
+        die(f"{ctx} returned invalid JSON: {e}\n{body[:2000]}")
 
 
 def extract_csr_id(resp_json: Dict[str, Any]) -> Optional[str]:
@@ -301,7 +326,7 @@ def generate_and_export(cfg: AppConfig) -> None:
             json_body=payload,
         )
         ensure_ok(r, f"Create CSR for {host}")
-        data = r.json()
+        data = response_json(r, f"Create CSR for {host}")
         csr_id = extract_csr_id(data)
         if not csr_id:
             die(f"CSR creation returned no id for {host}. Response: {data}")

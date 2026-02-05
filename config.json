@@ -1,0 +1,47 @@
+{
+  "ise": {
+    "base_url": "https://ise.example.local",
+    "username": "admin",
+    "password": "CHANGEME",
+    "verify_tls": true
+  },
+  "output_dir": "./out",
+  "signed_dir": "./signed",
+  "csr_defaults": {
+    "subject_template": "CN={host}",
+    "keyLength": 2048,
+    "digest": "SHA256",
+    "san": [],
+    "admin": true,
+    "eap": true,
+    "portal": false,
+    "pxgrid": false,
+    "radius": false,
+    "saml": false,
+    "ims": false
+  },
+  "bind_defaults": {
+    "friendlyName": "ise-signed",
+    "admin": true,
+    "eap": true,
+    "portal": false,
+    "pxgrid": false,
+    "radius": false,
+    "saml": false,
+    "ims": false,
+    "validateCertificateExtensions": true,
+    "allowOutOfDateCert": false,
+    "allowExtendedValidity": false,
+    "allowReplacementOfCertificates": true,
+    "allowReplacementOfPortalGroupTag": true
+  },
+  "nodes": [
+    {
+      "hostName": "ise-1.example.local",
+      "subject": "CN=ise-1.example.local",
+      "san": [
+        "DNS:ise-1.example.local"
+      ]
+    }
+  ]
+}
