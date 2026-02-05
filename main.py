@@ -15,6 +15,7 @@ Notes:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -155,6 +156,19 @@ def read_cert_pem(path: Path) -> str:
     return pem
 
 
+def normalize_base_url(base_url: str) -> str:
+    base_url = base_url.strip()
+    if not base_url:
+        die("Missing ise.base_url in config.")
+    if not base_url.startswith(("http://", "https://")):
+        die("ise.base_url must include scheme (http:// or https://).")
+    return base_url.rstrip("/")
+
+
+def env_password() -> str:
+    return os.environ.get("ISE_PASSWORD", "").strip()
+
+
 # ----------------------------
 # Config model
 # ----------------------------
@@ -181,9 +195,9 @@ def load_app_config(config_path: Path) -> AppConfig:
     raw = load_json(config_path)
 
     ise_raw = raw.get("ise") or {}
-    base_url = ise_raw.get("base_url") or die("Missing ise.base_url in config.")
+    base_url = normalize_base_url(str(ise_raw.get("base_url") or ""))
     username = ise_raw.get("username") or die("Missing ise.username in config.")
-    password = ise_raw.get("password") or ""
+    password = ise_raw.get("password") or env_password() or ""
 
     verify_tls = bool(ise_raw.get("verify_tls", True))
 
@@ -195,6 +209,17 @@ def load_app_config(config_path: Path) -> AppConfig:
     nodes = raw.get("nodes") or []
     if not nodes:
         die("Config has no nodes[]. Add at least one node with hostName.")
+
+    deduped_nodes: list[Dict[str, Any]] = []
+    seen_hosts = set()
+    for node in nodes:
+        host = node.get("hostName")
+        if not host:
+            die("Every node entry must include hostName.")
+        if host in seen_hosts:
+            die(f"Duplicate hostName in nodes: {host}")
+        seen_hosts.add(host)
+        deduped_nodes.append(node)
 
     # Prompt for password if blank/placeholder
     if not password or password.strip().upper() in ("CHANGEME", "CHANGE_ME", "PASSWORD"):
@@ -208,7 +233,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         signed_dir=signed_dir,
         csr_defaults=csr_defaults,
         bind_defaults=bind_defaults,
-        nodes=nodes,
+        nodes=deduped_nodes,
     )
 
 
@@ -400,14 +425,30 @@ def print_menu() -> None:
         "4) Exit\n"
     )
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Interactive CSR tool for Cisco ISE (ISE 3.1+ OpenAPI Certificates).",
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        default="./config.json",
+        help="Path to config.json (default: ./config.json).",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt.",
+    )
+    return parser.parse_args()
+
 
 def main() -> None:
+    args = parse_args()
+
     print("\nCisco ISE CSR Tool (interactive)\n")
 
-    # Config selection
-    default_cfg = Path("./config.json").resolve()
-    cfg_path_in = prompt("Path to config.json", str(default_cfg))
-    cfg_path = Path(cfg_path_in).expanduser().resolve()
+    cfg_path = Path(args.config).expanduser().resolve()
     if not cfg_path.exists():
         die(f"Config file not found: {cfg_path}")
 
@@ -421,7 +462,7 @@ def main() -> None:
     print(f"- signed_dir   : {cfg.signed_dir}")
     print(f"- nodes        : {len(cfg.nodes)}")
 
-    if not yes_no("\nContinue?", True):
+    if not args.yes and not yes_no("\nContinue?", True):
         raise SystemExit(0)
 
     while True:
