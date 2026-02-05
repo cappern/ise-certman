@@ -18,7 +18,26 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Create a `config.json` in the repo root (or pass `--config` to point elsewhere):
+This tool supports two modes:
+
+1. **State-driven (recommended)**: interactively create connections and certificate templates, stored in a lightweight state file.
+2. **Config-driven**: supply a static `config.json` with explicit node list (legacy workflow).
+
+### State-driven mode (recommended)
+
+On launch, you can create/select a **connection** (cluster) and then create **certificate templates** that define CSR/bind parameters and which nodes they apply to. The tool will fetch all nodes in the cluster automatically and store lightweight CSR state per cluster and template.
+
+You can override the state file location with `--state` (default: `~/.ise-certman/state.json`).
+
+### Config-driven mode
+
+Create a `config.json` in the repo root (or pass `--config` to point elsewhere). You can also generate a starter file using a template:
+
+```bash
+python main.py --template admin > config.json
+```
+
+Available templates: `admin`, `pxgrid`.
 
 ```json
 {
